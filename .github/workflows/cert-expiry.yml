@@ -1,0 +1,90 @@
+name: Certificate Expiry
+
+# Cloudflare Universal SSL is the ONLY certificate covering press kit
+# subdomains. Vercel has issued none, and cannot: wildcard issuance requires
+# delegating nameservers to Vercel, which would break the R2 custom domains
+# that need the zone to stay on Cloudflare.
+#
+# So if this renewal ever fails, every artist press kit goes down at once and
+# nothing else would tell us. BetterStack's free tier has no SSL check.
+#
+# Runs here, in a public repository, for two reasons:
+# 1. A certificate check that lives inside the app cannot report when the app
+#    is down. On 2026-07-16 /api/health died and stayed silent for three days.
+# 2. Public repos have no Actions minutes pool. In the private website repo
+#    this check was skipped on 2026-08-24 and 2026-08-31 because the account's
+#    minutes had run out. Monitoring must not depend on the thing it monitors,
+#    and not on a budget either.
+
+on:
+  schedule:
+    # Mondays 09:00 UTC. Cloudflare renews ~30 days out and the threshold below
+    # is 21, so a failed renewal is caught with a week of slack even if a run
+    # is skipped.
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+    inputs:
+      threshold_days:
+        description: 'Alert if the cert expires within this many days. Pass 9999 to force the alert and verify the Telegram wiring.'
+        required: false
+        default: '21'
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check certificate expiry
+        env:
+          # A wildcard host, not the apex: this is the certificate press kits
+          # actually present, and sowndhealth is a protected monitoring fixture.
+          HOST: sowndhealth.sownd.studio
+          # Cron passes no inputs, so this falls back to 21.
+          THRESHOLD_DAYS: ${{ github.event.inputs.threshold_days || '21' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+
+          alert() {
+            echo "::error::$1"
+            if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
+              curl -fsS -o /dev/null -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+                --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" \
+                --data-urlencode "text=SOWND certificate: $1 $RUN_URL" \
+                || echo "::warning::Telegram notify failed; job failure is still the signal"
+            else
+              echo "::warning::TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set, no Telegram alert sent"
+            fi
+            if [ -n "${DISCORD_WEBHOOK_URL:-}" ]; then
+              # jq -Rs handles quoting/newlines so a message can never break the payload
+              curl -fsS -o /dev/null -X POST "$DISCORD_WEBHOOK_URL" \
+                -H 'Content-Type: application/json' \
+                -d "$(jq -n --arg c "🔒 **SOWND certificate** — $1" '{content:$c}')" \
+                || echo "::warning::Discord notify failed; job failure is still the signal"
+            fi
+            exit 1
+          }
+
+          END_DATE=$(echo | openssl s_client -connect "$HOST:443" -servername "$HOST" 2>/dev/null \
+            | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+
+          # Unreachable or unreadable is itself a failure worth paging on. It
+          # means the TLS handshake that every press kit depends on did not work.
+          [ -n "$END_DATE" ] || alert "could not read a certificate from $HOST, TLS handshake failed"
+
+          END_EPOCH=$(date -u -d "$END_DATE" +%s) || alert "could not parse expiry date '$END_DATE' from $HOST"
+          DAYS=$(( (END_EPOCH - $(date -u +%s)) / 86400 ))
+
+          echo "$HOST expires $END_DATE ($DAYS days)"
+          echo "### 🔒 \`$HOST\`: $DAYS days remaining (expires $END_DATE)" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$DAYS" -lt "$THRESHOLD_DAYS" ]; then
+            alert "$HOST expires in $DAYS days ($END_DATE). Cloudflare Universal SSL renewal may have failed. Every press kit subdomain goes down when it lapses."
+          fi
+
+          echo "OK: $DAYS days remaining (threshold $THRESHOLD_DAYS)"
