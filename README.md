@@ -10,7 +10,8 @@ runner to R2.
 
 - Schedule: Sundays 05:00 UTC, plus manual runs from the Actions tab.
 - Output: `<YYYY-MM-DD>/backup-full-*.sql.gz` and `backup-schema-*.sql.gz`,
-  and a `latest.txt` marker at the bucket root.
+  and a `latest.txt` marker at the bucket root. `LAST_RUN` in this repo is a
+  heartbeat commit that keeps the cron schedule from being auto-disabled.
 - Retention: objects older than 30 days are deleted at the end of each run.
 - Scope: the `public` schema. Supabase-managed schemas (`auth`, `storage`,
   `vault`, ...) are excluded.
