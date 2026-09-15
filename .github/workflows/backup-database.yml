@@ -1,0 +1,164 @@
+name: Production Database Backup to Cloudflare R2
+
+# This repository is public so the job runs on GitHub's free public-repo minutes
+# and can never be starved by the private repos' CI. The run log is public too:
+# never print connection details here. Secrets are masked, but hostnames and
+# usernames are not.
+
+on:
+  schedule:
+    - cron: '0 5 * * 0' # Sundays 05:00 UTC
+  workflow_dispatch:
+
+# The job never needs the GITHUB_TOKEN. Grant it nothing.
+permissions: {}
+
+concurrency:
+  group: backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Install PostgreSQL client 17
+        run: |
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-17
+          pg_dump --version
+
+      - name: Ensure AWS CLI is present (S3 API for R2)
+        run: |
+          if ! command -v aws >/dev/null; then
+            curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+            unzip -q awscliv2.zip
+            sudo ./aws/install --update
+          fi
+          aws --version
+
+      - name: Check secrets are present
+        env:
+          DATABASE_URL: ${{ secrets.PRODUCTION_DATABASE_URL }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+        run: |
+          for v in DATABASE_URL R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_ACCOUNT_ID R2_BUCKET_NAME; do
+            if [ -z "${!v}" ]; then
+              echo "::error::secret $v is not set"
+              exit 1
+            fi
+          done
+          echo "All secrets present"
+
+      - name: Dump database
+        env:
+          DATABASE_URL: ${{ secrets.PRODUCTION_DATABASE_URL }}
+        run: |
+          BACKUP_DIR=/tmp/backup-production
+          mkdir -p "$BACKUP_DIR"
+          TIMESTAMP=$(date -u +%Y%m%d_%H%M%S)
+          BACKUP_DATE=$(date -u +%Y-%m-%d)
+          echo "BACKUP_DIR=$BACKUP_DIR" >> "$GITHUB_ENV"
+          echo "BACKUP_DATE=$BACKUP_DATE" >> "$GITHUB_ENV"
+
+          # libpq decodes percent-encoded passwords in the URI itself, so the
+          # URL is passed straight through instead of being parsed with sed.
+          EXCLUDES=(
+            --exclude-schema=auth
+            --exclude-schema=storage
+            --exclude-schema=extensions
+            --exclude-schema=graphql
+            --exclude-schema=graphql_public
+            --exclude-schema=net
+            --exclude-schema=pgbouncer
+            --exclude-schema=pgsodium
+            --exclude-schema=pgsodium_masks
+            --exclude-schema=realtime
+            --exclude-schema=supabase_functions
+            --exclude-schema=vault
+            --exclude-schema=information_schema
+            --exclude-schema=pg_catalog
+          )
+
+          FULL="$BACKUP_DIR/backup-full-$TIMESTAMP.sql"
+          SCHEMA="$BACKUP_DIR/backup-schema-$TIMESTAMP.sql"
+
+          pg_dump --dbname="$DATABASE_URL" \
+            --clean --if-exists --no-owner --no-acl \
+            "${EXCLUDES[@]}" > "$FULL"
+
+          pg_dump --dbname="$DATABASE_URL" \
+            --schema-only --clean --if-exists --no-owner --no-acl \
+            "${EXCLUDES[@]}" > "$SCHEMA"
+
+          # A dump that is suspiciously small means pg_dump connected but
+          # produced nothing useful. Fail loudly rather than upload it.
+          FULL_BYTES=$(stat -c %s "$FULL")
+          if [ "$FULL_BYTES" -lt 1000000 ]; then
+            echo "::error::full dump is only $FULL_BYTES bytes, refusing to upload"
+            exit 1
+          fi
+          echo "Full dump: $(du -h "$FULL" | cut -f1), schema dump: $(du -h "$SCHEMA" | cut -f1)"
+
+          gzip -9 "$FULL" "$SCHEMA"
+          echo "FULL_BACKUP=$FULL.gz" >> "$GITHUB_ENV"
+          echo "SCHEMA_BACKUP=$SCHEMA.gz" >> "$GITHUB_ENV"
+          echo "Compressed: $(du -h "$FULL.gz" | cut -f1) / $(du -h "$SCHEMA.gz" | cut -f1)"
+
+      - name: Upload to Cloudflare R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+        run: |
+          aws s3 cp "$FULL_BACKUP"   "s3://$R2_BUCKET_NAME/$BACKUP_DATE/" --endpoint-url "$R2_ENDPOINT" --no-progress
+          aws s3 cp "$SCHEMA_BACKUP" "s3://$R2_BUCKET_NAME/$BACKUP_DATE/" --endpoint-url "$R2_ENDPOINT" --no-progress
+
+          # Read back what landed. An upload that echoes success is not verified.
+          UPLOADED=$(aws s3 ls "s3://$R2_BUCKET_NAME/$BACKUP_DATE/" --endpoint-url "$R2_ENDPOINT" | wc -l)
+          if [ "$UPLOADED" -lt 2 ]; then
+            echo "::error::expected 2 objects under $BACKUP_DATE/, found $UPLOADED"
+            exit 1
+          fi
+
+          echo "$BACKUP_DATE" > /tmp/latest.txt
+          aws s3 cp /tmp/latest.txt "s3://$R2_BUCKET_NAME/latest.txt" --endpoint-url "$R2_ENDPOINT" --no-progress
+          echo "Uploaded and verified $UPLOADED objects for $BACKUP_DATE"
+
+      - name: Delete backups older than 30 days
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+        run: |
+          CUTOFF=$(date -u -d '30 days ago' +%Y-%m-%d)
+          aws s3 ls "s3://$R2_BUCKET_NAME/" --endpoint-url "$R2_ENDPOINT" --recursive | while read -r _ _ _ key; do
+            FILE_DATE=$(echo "$key" | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}' || true)
+            if [ -n "$FILE_DATE" ] && [[ "$FILE_DATE" < "$CUTOFF" ]]; then
+              echo "Deleting $key"
+              aws s3 rm "s3://$R2_BUCKET_NAME/$key" --endpoint-url "$R2_ENDPOINT" || true
+            fi
+          done
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Backup ${{ job.status }}"
+            echo "- Date: ${BACKUP_DATE:-n/a}"
+            echo "- Retention: 30 days, weekly on Sundays 05:00 UTC"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove temporary files
+        if: always()
+        run: rm -rf /tmp/backup-production /tmp/latest.txt
